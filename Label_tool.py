@@ -2,7 +2,7 @@ import sys
 import os
 import math
 from PyQt5.QtCore import Qt, QRectF, QPointF
-from PyQt5.QtGui import QPixmap, QPen, QColor, QFont
+from PyQt5.QtGui import QPixmap, QPen, QColor, QFont, QPainter
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QListWidget, QInputDialog, QLabel, QMessageBox
@@ -14,7 +14,7 @@ class LabelingCanvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
 
-        # Trạng thái dữ liệu
+        # Trạng thái dữ liệu ảnh & box
         self.image_path = ""
         self.pixmap = None
         self.scale = 1.0
@@ -27,15 +27,15 @@ class LabelingCanvas(QWidget):
         self.classes = []
         self.current_class_id = 0
 
-        # Kích thước box nháp (mặc định cho mode gợi ý)
-        self.draft_width = 100
-        self.draft_height = 100
+        # Kích thước box nháp (mặc định tối ưu cho ảnh 224 - 640)
+        self.draft_width = 80
+        self.draft_height = 80
 
-        # Trạng thái tương tác chuột
-        self.mode = "suggest" # "suggest" (gợi ý/vẽ kéo thả) hoặc "select" (chọn/sửa)
+        # Trạng thái tương tác
+        self.mode = "suggest" # "suggest" (gợi ý/vẽ) hoặc "select" (chọn/sửa)
         self.alt_pressed = False
         self.ctrl_pressed = False
-        self.is_drawing_drag = False  # Đang trong trạng thái kéo chuột để vẽ box tự do
+        self.is_drawing_drag = False
         
         self.selected_box_idx = -1
         self.resizing_handle = None # 'tl' (top-left), 'br' (bottom-right)
@@ -49,6 +49,14 @@ class LabelingCanvas(QWidget):
         self.scale = 1.0
         self.offset = QPointF(0, 0)
         self.is_drawing_drag = False
+        
+        # Tự động điều chỉnh độ mở rộng góc nhìn thích hợp cho ảnh 224 - 640
+        if self.pixmap and not self.pixmap.isNull():
+            w = self.pixmap.width()
+            if w <= 320:
+                self.scale = 1.8
+            elif w <= 640:
+                self.scale = 1.2
         self.update()
 
     def img_to_canvas(self, point):
@@ -60,23 +68,21 @@ class LabelingCanvas(QWidget):
                        (point.y() - self.offset.y()) / self.scale)
 
     def paintEvent(self, event):
-        from PyQt5.QtGui import QPainter
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # 1. Vẽ ảnh
-        if self.pixmap:
+        # 1. Vẽ Ảnh
+        if self.pixmap and not self.pixmap.isNull():
             scaled_w = self.pixmap.width() * self.scale
             scaled_h = self.pixmap.height() * self.scale
             target_rect = QRectF(self.offset.x(), self.offset.y(), scaled_w, scaled_h)
             painter.drawPixmap(target_rect, self.pixmap, QRectF(self.pixmap.rect()))
-
-        if not self.pixmap:
+        else:
             return
 
         img_w, img_h = self.pixmap.width(), self.pixmap.height()
 
-        # 2. Vẽ các Box đã định nghĩa
+        # 2. Vẽ các Bounding Box đã lưu
         for idx, b in enumerate(self.boxes):
             cx, cy = b['x_center'] * img_w, b['y_center'] * img_h
             bw, bh = b['width'] * img_w, b['height'] * img_h
@@ -93,34 +99,35 @@ class LabelingCanvas(QWidget):
             painter.setPen(pen)
             painter.drawRect(rect)
             
-            # Vẽ tên Class
-            class_name = str(b['class_id'])
+            # Tên Class hiển thị trên Box
+            class_name = f"ID:{b['class_id']}"
             for c in self.classes:
                 if c['id'] == b['class_id']:
-                    class_name = c['name']
+                    class_name = f"[{c['id']}] {c['name']}"
                     break
+            
             painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.setFont(QFont("Arial", 10, QFont.Bold))
-            painter.drawText(int(x1), int(y1 - 5), f"[{b['class_id']}] {class_name}")
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
+            painter.drawText(int(x1), int(max(12, y1 - 4)), class_name)
 
-            # Vẽ điểm neo kéo thả ở góc (nếu chọn)
+            # Vẽ nút kéo góc điều chỉnh kích thước
             if is_selected:
                 painter.setBrush(QColor(0, 0, 255))
                 painter.drawRect(QRectF(x1 - 4, y1 - 4, 8, 8))       # Top-Left (TL)
                 painter.drawRect(QRectF(x1 + w_c - 4, y1 + h_c - 4, 8, 8)) # Bottom-Right (BR)
 
-        # 3. Vẽ Box nháp gợi ý hoặc Khung xem trước khi kéo thả chuột
+        # 3. Vẽ Box gợi ý nháp hoặc khung chọn kéo thả
         if self.mode == "suggest" and self.underMouse():
             cursor_pos = self.mapFromGlobal(self.cursor().pos())
             painter.setPen(QPen(QColor(255, 255, 0), 1.5, Qt.DashLine))
 
             if self.is_drawing_drag:
-                # Đang đè giữ chuột để vẽ khung tự do
+                # Kéo thả chuột vẽ khung nét đứt
                 start_c = self.img_to_canvas(self.drag_start_img_pos)
                 rect_drag = QRectF(start_c, cursor_pos).normalized()
                 painter.drawRect(rect_drag)
             else:
-                # Đang rê chuột (hiển thị khung nháp hình chữ nhật cố định kích thước)
+                # Hiển thị box gợi ý nháp quanh tâm con trỏ chuột
                 bw_c = self.draft_width * self.scale
                 bh_c = self.draft_height * self.scale
                 x1 = cursor_pos.x() - bw_c / 2
@@ -131,7 +138,7 @@ class LabelingCanvas(QWidget):
                 painter.drawPoint(cursor_pos)
 
     def mousePressEvent(self, event):
-        if not self.pixmap:
+        if not self.pixmap or self.pixmap.isNull():
             return
 
         pos = event.pos()
@@ -140,13 +147,12 @@ class LabelingCanvas(QWidget):
 
         if event.button() == Qt.LeftButton:
             if self.mode == "suggest":
-                # Bắt đầu kéo thả vẽ box mới
                 self.is_drawing_drag = True
                 self.drag_start_img_pos = img_pos
                 self.update()
             
             elif self.mode == "select":
-                # Kiểm tra kéo thả góc box đang được chọn
+                # Kiểm tra kéo góc box đang chọn
                 if self.selected_box_idx >= 0:
                     b = self.boxes[self.selected_box_idx]
                     cx, cy = b['x_center'] * img_w, b['y_center'] * img_h
@@ -154,7 +160,7 @@ class LabelingCanvas(QWidget):
                     x1, y1 = cx - bw/2, cy - bh/2
                     x2, y2 = cx + bw/2, cy + bh/2
 
-                    threshold = 15 / self.scale
+                    threshold = 12 / self.scale
                     dist_tl = math.hypot(img_pos.x() - x1, img_pos.y() - y1)
                     dist_br = math.hypot(img_pos.x() - x2, img_pos.y() - y2)
 
@@ -165,7 +171,7 @@ class LabelingCanvas(QWidget):
                         self.resizing_handle = 'br'
                         return
 
-                # Chọn box khác
+                # Chọn box khác khi click vào vùng thuộc tính
                 self.selected_box_idx = -1
                 for idx, b in enumerate(self.boxes):
                     cx, cy = b['x_center'] * img_w, b['y_center'] * img_h
@@ -191,17 +197,17 @@ class LabelingCanvas(QWidget):
             x2, y2 = cx + bw/2, cy + bh/2
 
             if self.resizing_handle == 'tl':
-                # Giữ nguyên góc Bottom-Right (x2, y2)
+                # Góc trỏ dưới phải (x2, y2) giữ cố định
                 x1_new, y1_new = img_pos.x(), img_pos.y()
-                new_w = max(5, x2 - x1_new)
-                new_h = max(5, y2 - y1_new)
+                new_w = max(4, x2 - x1_new)
+                new_h = max(4, y2 - y1_new)
                 new_cx = x2 - new_w / 2
                 new_cy = y2 - new_h / 2
             else: # 'br'
-                # Giữ nguyên góc Top-Left (x1, y1)
+                # Góc trỏ trên trái (x1, y1) giữ cố định
                 x2_new, y2_new = img_pos.x(), img_pos.y()
-                new_w = max(5, x2_new - x1)
-                new_h = max(5, y2_new - y1)
+                new_w = max(4, x2_new - x1)
+                new_h = max(4, y2_new - y1)
                 new_cx = x1 + new_w / 2
                 new_cy = y1 + new_h / 2
 
@@ -225,7 +231,7 @@ class LabelingCanvas(QWidget):
             w = x2 - x1
             h = y2 - y1
 
-            # NẾU KÍCH THƯỚC KÉO THẢ RẤT NHỎ -> ĐƯỢC TÍNH LÀ 1 CLICK ĐẶT TÂM BOX NHÁP
+            # Click nhanh nhẹ -> Dùng độ rộng/cao gợi ý nháp
             if w < 5 or h < 5:
                 w = self.draft_width
                 h = self.draft_height
@@ -235,7 +241,6 @@ class LabelingCanvas(QWidget):
                 cx = x1 + w / 2
                 cy = y1 + h / 2
 
-            # Tạo box mới
             new_box = {
                 'class_id': self.current_class_id,
                 'x_center': cx / img_w,
@@ -245,7 +250,7 @@ class LabelingCanvas(QWidget):
             }
             self.boxes.append(new_box)
             self.selected_box_idx = len(self.boxes) - 1
-            self.mode = "select" # Tự động chuyển qua chế độ chọn/sửa sau khi tạo xong
+            self.mode = "select" # Tự động nhảy qua mode chỉnh sửa
             self.update()
 
         self.resizing_handle = None
@@ -253,14 +258,14 @@ class LabelingCanvas(QWidget):
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         
-        # 1. Thu phóng kích thước nhãn nháp: Alt + Lăn chuột
+        # 1. Thu phóng khung nhãn nháp: Alt + Lăn chuột (Đã cải tiến độ nhạy)
         if self.alt_pressed:
-            factor = 1.1 if delta > 0 else 0.9
-            self.draft_width = max(10, self.draft_width * factor)
-            self.draft_height = max(10, self.draft_height * factor)
+            step = 6 if delta > 0 else -6
+            self.draft_width = max(8, self.draft_width + step)
+            self.draft_height = max(8, self.draft_height + step)
             self.update()
             
-        # 2. Thu phóng ảnh (Zoom): Ctrl + Lăn chuột
+        # 2. Zoom ảnh: Ctrl + Lăn chuột
         elif self.ctrl_pressed:
             cursor_pos = event.pos()
             old_img_pos = self.canvas_to_img(cursor_pos)
@@ -268,7 +273,6 @@ class LabelingCanvas(QWidget):
             factor = 1.15 if delta > 0 else 0.85
             self.scale *= factor
             
-            # Căn chỉnh lại offset để zoom theo vị trí con trỏ chuột
             new_x = cursor_pos.x() - old_img_pos.x() * self.scale
             new_y = cursor_pos.y() - old_img_pos.y() * self.scale
             self.offset = QPointF(new_x, new_y)
@@ -281,7 +285,16 @@ class LabelingCanvas(QWidget):
             self.update()
         elif event.key() == Qt.Key_Control:
             self.ctrl_pressed = True
-            
+        # Thêm phím tắt mở rộng thu phóng box nháp nhanh bằng phím '[' và ']'
+        elif event.key() == Qt.Key_BracketRight:
+            self.draft_width += 5
+            self.draft_height += 5
+            self.update()
+        elif event.key() == Qt.Key_BracketLeft:
+            self.draft_width = max(8, self.draft_width - 5)
+            self.draft_height = max(8, self.draft_height - 5)
+            self.update()
+
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Alt:
             self.alt_pressed = False
@@ -291,7 +304,7 @@ class LabelingCanvas(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YOLO Object Detection Labeling Tool")
+        self.setWindowTitle("YOLO Labeling Tool (Ảnh nhỏ 224-640)")
         self.resize(1200, 800)
 
         self.input_dir = ""
@@ -306,14 +319,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         layout = QHBoxLayout(main_widget)
 
-        # Panel bên trái: Canvas hiển thị & đánh nhãn
+        # Panel trái: Vùng vẽ
         self.canvas = LabelingCanvas(self)
         layout.addWidget(self.canvas, stretch=4)
 
-        # Panel bên phải: Điều khiển & Quản lý nhãn
+        # Panel phải: Nút bấm điều hướng & danh mục
         right_panel = QVBoxLayout()
         
-        # Nút chọn thư mục
+        # Thư mục
         self.btn_input = QPushButton("Thư mục ảnh (Input)")
         self.btn_input.clicked.connect(self.select_input_dir)
         right_panel.addWidget(self.btn_input)
@@ -322,27 +335,44 @@ class MainWindow(QMainWindow):
         self.btn_output.clicked.connect(self.select_output_dir)
         right_panel.addWidget(self.btn_output)
 
-        # Thông tin ảnh
-        self.lbl_info = QLabel("Chưa chọn ảnh")
+        self.lbl_info = QLabel("Chưa chọn thư mục")
         right_panel.addWidget(self.lbl_info)
 
-        # Thanh quản lý ID và Tên nhãn (Classes)
+        # Quản lý danh mục nhãn
         right_panel.addWidget(QLabel("<b>Danh sách Nhãn (Classes):</b>"))
         self.class_list_widget = QListWidget()
         self.class_list_widget.currentRowChanged.connect(self.change_selected_class)
         right_panel.addWidget(self.class_list_widget)
 
-        btn_add_class = QPushButton("Thêm Nhãn mới")
+        # Bộ nút Thêm / Sửa / Xóa Nhãn
+        btn_class_layout = QHBoxLayout()
+        
+        btn_add_class = QPushButton("Thêm")
         btn_add_class.clicked.connect(self.add_class)
-        right_panel.addWidget(btn_add_class)
+        btn_class_layout.addWidget(btn_add_class)
 
-        # Chọn class cho Box đang chọn
-        right_panel.addWidget(QLabel("<b>Gán Nhãn cho Box chọn:</b>"))
-        self.btn_apply_class = QPushButton("Đổi ID Class cho Box chọn")
-        self.btn_apply_class.clicked.connect(self.apply_class_to_selected_box)
-        right_panel.addWidget(self.btn_apply_class)
+        btn_edit_class = QPushButton("Sửa Tên")
+        btn_edit_class.clicked.connect(self.edit_class)
+        btn_class_layout.addWidget(btn_edit_class)
 
-        # Nút lưu & chuyển ảnh
+        btn_delete_class = QPushButton("Xóa Nhãn")
+        btn_delete_class.clicked.connect(self.delete_class)
+        btn_class_layout.addWidget(btn_delete_class)
+
+        right_panel.addLayout(btn_class_layout)
+
+        # Thao tác với Bounding Box
+        right_panel.addWidget(QLabel("<b>Thao tác với Bounding Box:</b>"))
+        
+        btn_apply = QPushButton("Gán Nhãn cho Box chọn")
+        btn_apply.clicked.connect(self.apply_class_to_selected_box)
+        right_panel.addWidget(btn_apply)
+
+        btn_delete_box = QPushButton("Xóa Box đang chọn (Delete)")
+        btn_delete_box.clicked.connect(self.delete_selected_box)
+        right_panel.addWidget(btn_delete_box)
+
+        # Chuyển ảnh & Lưu
         btn_save = QPushButton("Lưu nhãn (S)")
         btn_save.clicked.connect(self.save_labels)
         right_panel.addWidget(btn_save)
@@ -354,6 +384,16 @@ class MainWindow(QMainWindow):
         btn_prev = QPushButton("Ảnh trước (A / <-)")
         btn_prev.clicked.connect(self.prev_image)
         right_panel.addWidget(btn_prev)
+
+        # Bảng hướng dẫn phím tắt nhỏ
+        help_lbl = QLabel(
+            "<small><b>Mẹo thao tác:</b><br>"
+            "• Phím <b>Alt</b>: Bật/tắt chế độ vẽ<br>"
+            "• Phím <b>[</b> và <b>]</b>: Phóng to/thu nhỏ khung nháp<br>"
+            "• Phím <b>Ctrl + Lăn chuột</b>: Zoom ảnh<br>"
+            "• Phím <b>Delete</b>: Xóa Box chọn</small>"
+        )
+        right_panel.addWidget(help_lbl)
 
         right_panel.addStretch()
         layout.addLayout(right_panel, stretch=1)
@@ -373,7 +413,7 @@ class MainWindow(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(self, "Chọn thư mục Output lưu nhãn")
         if dir_path:
             self.output_dir = dir_path
-            self.load_classes_txt() # Đọc file classes.txt nếu đã tồn tại sẵn trong thư mục Output
+            self.load_classes_txt()
 
     def load_image_data(self):
         if not (0 <= self.current_img_idx < len(self.image_files)):
@@ -383,7 +423,6 @@ class MainWindow(QMainWindow):
         img_path = os.path.join(self.input_dir, filename)
         
         boxes = []
-        # Tự động đọc nhãn .txt tương ứng nếu đã tồn tại trong Output
         if self.output_dir:
             txt_filename = os.path.splitext(filename)[0] + ".txt"
             txt_path = os.path.join(self.output_dir, txt_filename)
@@ -410,7 +449,6 @@ class MainWindow(QMainWindow):
         if self.current_img_idx < 0:
             return
 
-        # 1. Lưu file nhãn .txt cho ảnh hiện tại
         filename = self.image_files[self.current_img_idx]
         txt_filename = os.path.splitext(filename)[0] + ".txt"
         txt_path = os.path.join(self.output_dir, txt_filename)
@@ -423,13 +461,10 @@ class MainWindow(QMainWindow):
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(lines))
         
-        # 2. Xuất/lưu file classes.txt vào thư mục Output
         self.export_classes_txt()
-        
-        QMessageBox.information(self, "Thông báo", f"Đã lưu nhãn và file classes.txt thành công!")
+        QMessageBox.information(self, "Thông báo", f"Đã lưu nhãn và file classes.txt!")
 
     def export_classes_txt(self):
-        """Tự động xuất danh sách các nhãn hiện có vào file classes.txt"""
         if not self.output_dir:
             return
         classes_path = os.path.join(self.output_dir, "classes.txt")
@@ -440,7 +475,6 @@ class MainWindow(QMainWindow):
             f.write("\n".join(class_names))
 
     def load_classes_txt(self):
-        """Tự động đọc file classes.txt nếu đã có sẵn trong thư mục Output"""
         if not self.output_dir:
             return
         classes_path = os.path.join(self.output_dir, "classes.txt")
@@ -452,29 +486,90 @@ class MainWindow(QMainWindow):
                 for idx, name in enumerate(lines):
                     new_class = {'id': idx, 'name': name}
                     self.canvas.classes.append(new_class)
-                    self.class_list_widget.addItem(f"[{idx}] {name}")
-            if self.canvas.classes:
-                self.class_list_widget.setCurrentRow(0)
+            self.refresh_class_list_ui()
+
+    def refresh_class_list_ui(self):
+        """Cập nhật lại toàn bộ giao diện danh sách Class sau khi thêm/sửa/xóa"""
+        self.class_list_widget.clear()
+        for c in sorted(self.canvas.classes, key=lambda x: x['id']):
+            self.class_list_widget.addItem(f"[{c['id']}] {c['name']}")
+        
+        if self.canvas.classes:
+            self.class_list_widget.setCurrentRow(min(self.canvas.current_class_id, len(self.canvas.classes) - 1))
 
     def add_class(self):
-        name, ok = QInputDialog.getText(self, "Thêm Class", "Nhập tên nhãn:")
-        if ok and name:
+        name, ok = QInputDialog.getText(self, "Thêm Nhãn mới", "Nhập tên nhãn:")
+        if ok and name.strip():
+            # Tự động gán ID theo thứ tự nối tiếp
             class_id = len(self.canvas.classes)
-            new_class = {'id': class_id, 'name': name}
+            new_class = {'id': class_id, 'name': name.strip()}
             self.canvas.classes.append(new_class)
-            self.class_list_widget.addItem(f"[{class_id}] {name}")
-            self.class_list_widget.setCurrentRow(class_id)
-            # Tự động xuất/cập nhật classes.txt khi thêm nhãn mới
+            self.refresh_class_list_ui()
             self.export_classes_txt()
 
+    def edit_class(self):
+        row = self.class_list_widget.currentRow()
+        if row < 0 or row >= len(self.canvas.classes):
+            QMessageBox.warning(self, "Chú ý", "Vui lòng chọn 1 nhãn để đổi tên!")
+            return
+        
+        current_class = self.canvas.classes[row]
+        new_name, ok = QInputDialog.getText(
+            self, "Sửa tên Nhãn", f"Đổi tên nhãn ID [{current_class['id']}]:", text=current_class['name']
+        )
+        if ok and new_name.strip():
+            current_class['name'] = new_name.strip()
+            self.refresh_class_list_ui()
+            self.export_classes_txt()
+            self.canvas.update()
+
+    def delete_class(self):
+        row = self.class_list_widget.currentRow()
+        if row < 0 or row >= len(self.canvas.classes):
+            QMessageBox.warning(self, "Chú ý", "Vui lòng chọn 1 nhãn để xóa!")
+            return
+
+        deleted_id = self.canvas.classes[row]['id']
+        
+        # 1. Xóa nhãn khỏi danh mục
+        del self.canvas.classes[row]
+
+        # 2. Offset lại danh sách ID liên tục (0, 1, 2...)
+        for c in self.canvas.classes:
+            if c['id'] > deleted_id:
+                c['id'] -= 1
+
+        # 3. Offset lại ID tương ứng trên các Box đã vẽ trong ảnh hiện tại
+        new_boxes = []
+        for b in self.canvas.boxes:
+            if b['class_id'] == deleted_id:
+                continue # Xóa luôn box thuộc nhãn vừa xóa
+            elif b['class_id'] > deleted_id:
+                b['class_id'] -= 1 # Offset giật lùi ID
+            new_boxes.append(b)
+        
+        self.canvas.boxes = new_boxes
+        self.canvas.selected_box_idx = -1
+        
+        # Cập nhật lại UI & File classes.txt
+        self.refresh_class_list_ui()
+        self.export_classes_txt()
+        self.canvas.update()
+
     def change_selected_class(self, row):
-        if row >= 0 and row < len(self.canvas.classes):
+        if 0 <= row < len(self.canvas.classes):
             self.canvas.current_class_id = self.canvas.classes[row]['id']
 
     def apply_class_to_selected_box(self):
         if self.canvas.selected_box_idx >= 0 and self.class_list_widget.currentRow() >= 0:
             box = self.canvas.boxes[self.canvas.selected_box_idx]
             box['class_id'] = self.canvas.current_class_id
+            self.canvas.update()
+
+    def delete_selected_box(self):
+        if self.canvas.selected_box_idx >= 0:
+            del self.canvas.boxes[self.canvas.selected_box_idx]
+            self.canvas.selected_box_idx = -1
             self.canvas.update()
 
     def next_image(self):
@@ -498,10 +593,8 @@ class MainWindow(QMainWindow):
             self.prev_image()
         elif event.key() == Qt.Key_S:
             self.save_labels()
-        elif event.key() == Qt.Key_Delete and self.canvas.selected_box_idx >= 0:
-            del self.canvas.boxes[self.canvas.selected_box_idx]
-            self.canvas.selected_box_idx = -1
-            self.canvas.update()
+        elif event.key() == Qt.Key_Delete:
+            self.delete_selected_box()
         else:
             super().keyPressEvent(event)
 
