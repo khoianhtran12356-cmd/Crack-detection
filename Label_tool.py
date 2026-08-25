@@ -288,7 +288,6 @@ class LabelingCanvas(QWidget):
         elif event.key() == Qt.Key_Control:
             self.ctrl_pressed = False
 
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -500,4 +499,14 @@ class MainWindow(QMainWindow):
         elif event.key() == Qt.Key_S:
             self.save_labels()
         elif event.key() == Qt.Key_Delete and self.canvas.selected_box_idx >= 0:
-            del s
+            del self.canvas.boxes[self.canvas.selected_box_idx]
+            self.canvas.selected_box_idx = -1
+            self.canvas.update()
+        else:
+            super().keyPressEvent(event)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
